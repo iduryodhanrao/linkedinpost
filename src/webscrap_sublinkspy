@@ -1,0 +1,183 @@
+import requests
+from bs4 import BeautifulSoup
+import datetime
+from urllib.parse import urljoin
+#to allow execute the javascript on the page and get fully rendered html
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+import google.generativeai as genai
+from dotenv import load_dotenv
+import os
+
+# --- Configuration & Setup ---
+load_dotenv()
+BASE_URL = "https://www.turingpost.com"
+MAIN_PAGE_URL = f"{BASE_URL}/t/AI-101"
+OUTPUT_FILE = "ai_summary_detailed.txt"
+# Configure the Gemini API
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# --- New Function: Summarize with Gemini API ---
+def summarize_with_gemini(text_to_summarize):
+    """Calls the Gemini API to get a high-quality summary."""
+    if not GOOGLE_API_KEY:
+        return "ERROR: GOOGLE_API_KEY not found. Please check your .env file."
+        
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        prompt = f"Summarize the following article text for linked-in post in 3-4 clear and concise sentences or bullet points:\n\n---\n\n{text_to_summarize}"
+        
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"   - ❌ Gemini API Error: {e}")
+        return "Could not generate summary due to an API error."
+    
+# --- Step 1: Fetch Webpage Content (Selenium to handle javascript script run and cookie banners) ---
+def get_page_content(url):
+    """
+    Fetches the full HTML by using Selenium to first handle any cookie consent banners.
+    """
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.get(url)
+
+        # Use an explicit wait to handle the cookie banner
+        try:
+            # Wait up to 10 seconds for a button containing the text "Accept" to be clickable
+            wait = WebDriverWait(driver, 10)
+            accept_button = wait.until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Accept')]"))
+            )
+            accept_button.click()
+            print(f"✅ Clicked the cookie consent button on: {url}")
+            # Wait a moment for the banner to disappear
+            time.sleep(2) 
+        except Exception:
+            # If no button is found, it might already be accepted. Continue anyway.
+            print(f"🟡 Cookie banner not found on {url} (or already accepted).")
+
+        html_content = driver.page_source
+        print(f"✅ Successfully fetched dynamic content from: {url}")
+        return BeautifulSoup(html_content, 'html.parser')
+
+    except Exception as e:
+        print(f"❌ Error fetching {url} with Selenium: {e}")
+        return None
+    finally:
+        if driver:
+            driver.quit()
+
+# --- Step 2: Get all Topic Links from the Main Page ---
+def get_topic_links(soup):
+    """Finds all the article links on the main AI-101 page using the current HTML structure."""
+    links = []
+    
+    # The new structure has links within divs with the class 'pencraft'
+    #topic_containers = soup.find_all('div', class_='')
+    topic_containers = soup.select('a[href^="/p/"]')
+    
+    for container in topic_containers:
+        # Find the <a> tag within each container
+        #link_tag = container.find('a', href=True)
+        print(container)
+        link_tag = container
+        if link_tag:
+            # Construct the full, absolute URL
+            full_url = urljoin(BASE_URL, link_tag['href'])
+            links.append(full_url)
+            
+    if not links:
+        print("❌ WARNING: Still found zero topic links. The website structure may have changed again.")
+    else:
+        print(f"✅ Found {len(links)} topic links to scrape.")
+        
+    return links
+
+# --- Step 3: Scrape and Summarize a Single Article Page ---
+def scrape_and_summarize_article(url):
+    """Visits a single article page, extracts the text, and summarizes it."""
+    article_soup = get_page_content(url)
+    if not article_soup:
+        return ""
+
+    # The main article content is typically in <p> tags.
+    # We find a container div and get all paragraphs within it.
+    # Note: This selector might need updating if the site structure changes.
+    content_area = article_soup.find('div', class_='available-content') # A more specific selector
+    if not content_area:
+        content_area = article_soup # Fallback to the whole page
+        
+    paragraphs = content_area.find_all('p')
+    full_text = " ".join([p.get_text(strip=True) for p in paragraphs])
+    
+    if not full_text:
+        return "Could not find article text."
+        
+    # Basic summarization: take the first 3 sentences.
+    print("   - Sending text to Gemini for summarization...")
+    summary = summarize_with_gemini(full_text)
+    return summary
+
+# --- Step 4: Save Summaries to a File ---
+def save_summaries_to_file(summaries, filename):
+    """Writes the collected summaries to a local text file."""
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"Detailed AI 101 Summary - {datetime.date.today()}\n")
+            f.write("="*40 + "\n\n")
+            
+            for item in summaries:
+                f.write(f"## {item['topic']}\n")
+                f.write(f"{item['summary']}\n\n")
+        
+        print(f"✅ All summaries saved to '{filename}'")
+    except IOError as e:
+        print(f"❌ Error writing to file: {e}")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    print(f"Starting the AI summary process for: {MAIN_PAGE_URL}")
+    
+    # Get the main page to find all the links
+    main_page_soup = get_page_content(MAIN_PAGE_URL)
+    try:
+        with open('ai_summary.txt', 'w', encoding='utf-8') as f:
+            f.write(main_page_soup.prettify())
+            
+        print(f"✅ Webscrap html written to ai_summary.txt'")
+    except IOError as e:
+        print(f"❌ Error writing to file: {e}")
+    
+    if main_page_soup:
+        topic_urls = get_topic_links(main_page_soup)
+        print(topic_urls)
+        all_summaries = []
+        i = 0
+        # Loop through each topic URL, scrape, and summarize
+        for url in topic_urls:
+            # Extract topic title from URL for the report
+            topic_title = url.split('/')[-1].replace('-', ' ').title()
+            print(f"   - Processing: {topic_title}...")
+            i = i+1
+            if i > 2:
+                break
+            summary_text = scrape_and_summarize_article(url)
+            all_summaries.append({
+                "topic": topic_title,
+                "summary": summary_text
+            })
+        
+        # Save all collected summaries to the file
+        save_summaries_to_file(all_summaries, OUTPUT_FILE)
